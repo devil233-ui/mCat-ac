@@ -8,6 +8,7 @@
 logs/
 
 # 临时文件
+temp/
 *.tmp
 *.temp
 

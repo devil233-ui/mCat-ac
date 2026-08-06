@@ -48,6 +48,95 @@ let schedule = {
 // 模块级用户状态存储，确保所有实例共享同一个状态对象
 let userInputStatus = {};
 
+// TRSS-Yunzai会为每条消息创建插件实例，进程级资源必须跨实例共享。
+// 使用全局Symbol保存状态，以便热更新时能够清理上一版模块留下的资源。
+const LIFECYCLE_KEY = Symbol.for('mCat-ac.lifecycle');
+const previousLifecycle = globalThis[LIFECYCLE_KEY];
+if (previousLifecycle?.dispose) {
+  previousLifecycle.dispose();
+}
+
+const lifecycleState = {
+  initialized: false,
+  dependenciesInitialized: false,
+  dependenciesPromise: null,
+  owner: null,
+  cleanupInterval: null,
+  exitHandler: null,
+  sigintHandler: null,
+  configCache: new Map(),
+  watchers: new Map(),
+  pendingScreenshots: new Set(),
+  isGeneratingImages: false,
+  dispose: null
+};
+
+function disposeLifecycle() {
+  if (lifecycleState.cleanupInterval) {
+    clearInterval(lifecycleState.cleanupInterval);
+    lifecycleState.cleanupInterval = null;
+  }
+
+  if (lifecycleState.exitHandler) {
+    process.removeListener('exit', lifecycleState.exitHandler);
+    lifecycleState.exitHandler = null;
+  }
+
+  if (lifecycleState.sigintHandler) {
+    process.removeListener('SIGINT', lifecycleState.sigintHandler);
+    lifecycleState.sigintHandler = null;
+  }
+
+  for (const watcher of lifecycleState.watchers.values()) {
+    Promise.resolve(watcher.close()).catch(() => {});
+  }
+  lifecycleState.watchers.clear();
+  lifecycleState.configCache.clear();
+  lifecycleState.owner = null;
+  lifecycleState.initialized = false;
+}
+
+lifecycleState.dispose = disposeLifecycle;
+globalThis[LIFECYCLE_KEY] = lifecycleState;
+
+function initializeLifecycle(owner) {
+  if (lifecycleState.initialized) return;
+
+  lifecycleState.initialized = true;
+  lifecycleState.owner = owner;
+
+  lifecycleState.exitHandler = () => disposeLifecycle();
+  lifecycleState.sigintHandler = () => {
+    const cleanup = lifecycleState.owner?._cleanupTempFiles();
+    disposeLifecycle();
+    Promise.resolve(cleanup).finally(() => process.exit(0));
+  };
+  process.once('exit', lifecycleState.exitHandler);
+  process.once('SIGINT', lifecycleState.sigintHandler);
+
+  lifecycleState.cleanupInterval = setInterval(async () => {
+    try {
+      await lifecycleState.owner?._cleanupTempFiles();
+    } catch (error) {
+      logger.error(`${COLORS.RED}mCat-ac: 定时清理临时文件失败: ${error.message}${COLORS.RESET}`);
+    }
+  }, 60 * 60 * 1000);
+  lifecycleState.cleanupInterval.unref?.();
+
+  lifecycleState.dependenciesPromise = initializeDependencies()
+    .then(async () => {
+      lifecycleState.dependenciesInitialized = true;
+      global.mCatAcDependenciesInitialized = true;
+      owner.axios = axios;
+      owner.schedule = schedule;
+      if (owner.needInit) await owner.performInit();
+    })
+    .catch(error => {
+      lifecycleState.dependenciesPromise = null;
+      console.error(`${COLORS.RED}mCat-ac: 依赖初始化失败: ${error.message}${COLORS.RESET}`);
+    });
+}
+
 // 异步初始化函数
 async function initializeDependencies() {
   // 尝试导入日志模块，适配不同环境
@@ -224,9 +313,9 @@ class AchievementCheck extends plugin {
       ]
     });
     
-    // 初始化配置缓存和监听机制
-    this.configCache = new Map();
-    this.watchers = new Map();
+    // 配置缓存和监听器属于进程级资源，不能随消息实例重复创建
+    this.configCache = lifecycleState.configCache;
+    this.watchers = lifecycleState.watchers;
     // 保存axios和schedule实例到类属性
     this.axios = axios;
     this.schedule = schedule;
@@ -245,55 +334,6 @@ class AchievementCheck extends plugin {
       global.mCatAcVersion = '未知';
     }
     
-    // 触发异步依赖初始化，避免构造函数直接使用async
-    // 检查是否已经初始化过依赖，避免重复初始化
-    if (!global.mCatAcDependenciesInitialized) {
-      setTimeout(async () => {
-        try {
-          await initializeDependencies();
-          
-          // 确保logger有必要的方法
-          if (!logger) logger = console
-          if (!logger.info) logger.info = console.info.bind(console)
-          if (!logger.error) logger.error = console.error.bind(console)
-          if (!logger.debug) logger.debug = console.debug ? console.debug.bind(console) : console.log.bind(console)
-          
-          // 移除初始化完成日志
-          
-          // 设置全局标记，表示依赖已初始化
-          global.mCatAcDependenciesInitialized = true
-          // 标记实例依赖初始化完成
-          this.dependenciesInitialized = true
-          
-          // 如果插件已经被加载且需要初始化，执行初始化
-          if (this.needInit) {
-            await this.performInit()
-          }
-          
-          // 初始化完成后，如果需要可以在这里执行其他初始化操作
-          // 注意：initData方法会在插件加载过程中由其他地方调用，避免重复初始化
-          // if (typeof this.initData === 'function') {
-          //   await this.initData();
-          // }
-        } catch (error) {
-          console.error(`${COLORS.RED}mCat-ac: 依赖初始化失败: ${error.message}${COLORS.RESET}`);
-        }
-      }, 0);
-    } else {
-      // 如果已经初始化过，直接标记为完成
-      this.dependenciesInitialized = true
-      if (this.needInit) {
-        // 使用setTimeout包装异步调用，避免在构造函数中使用await
-        setTimeout(async () => {
-          try {
-            await this.performInit()
-          } catch (error) {
-            console.error(`${COLORS.RED}mCat-ac: 初始化失败: ${error.message}${COLORS.RESET}`)
-          }
-        }, 0)
-      }
-    }
-    
     // 配置项
     this.config = {
       updateDays: 20,
@@ -305,28 +345,19 @@ class AchievementCheck extends plugin {
     // 初始化状态标志
     this.performInitCompleted = false;
     
-    // 状态跟踪
-    this._isGeneratingImages = false
-    this._pendingScreenshots = new Set() // 跟踪待处理的截图任务
-    
-    // 添加进程退出监听，清理资源
-    process.on('exit', this._cleanupResources.bind(this))
-    // 捕获SIGINT信号 (Ctrl+C)
-    process.on('SIGINT', () => {
-      this._cleanupResources()
-      process.exit(0)
+    // 图片任务状态需要跨消息实例共享，否则并发保护不会生效
+    this._pendingScreenshots = lifecycleState.pendingScreenshots
+    Object.defineProperty(this, '_isGeneratingImages', {
+      configurable: true,
+      get: () => lifecycleState.isGeneratingImages,
+      set: value => { lifecycleState.isGeneratingImages = value }
     })
-    
-    // 设置定时清理任务，每小时执行一次
-    this._cleanupInterval = setInterval(async () => {
-      try {
-        await this._cleanupTempFiles()
-      } catch (error) {
-        logger.error(`${COLORS.RED}mCat-ac: 定时清理临时文件失败: ${error.message}${COLORS.RESET}`)
-      }
-    }, 60 * 60 * 1000) // 1小时
-    
-    // 移除定期清理任务启动日志
+    Object.defineProperty(this, 'dependenciesInitialized', {
+      configurable: true,
+      get: () => lifecycleState.dependenciesInitialized
+    })
+
+    initializeLifecycle(this)
   }
   
   // 执行初始化（在构造函数中通过setTimeout调用）
@@ -512,16 +543,17 @@ class AchievementCheck extends plugin {
       // 生成HTML内容
       const html = await this.generateHelpHtml(renderData)
       
-      // 保存HTML到临时文件
-      const htmlPath = path.join(tempDir, `${Date.now()}.html`)
+      // HTML与PNG共用同一渲染ID，确保延迟清理能找到关联文件
+      const renderId = `${Date.now()}`
+      const htmlPath = path.join(tempDir, `${renderId}.html`)
       await fs.writeFile(htmlPath, html, 'utf8')
       logger.info(`mCat-ac: 已保存HTML到: ${htmlPath}`)
       
       // 使用puppeteer渲染 - 设置固定宽度800px，高度自适应
-      const imagePath = path.join(tempDir, `${Date.now()}.png`)
+      const imagePath = path.join(tempDir, `${renderId}.png`)
       
       // 生成截图任务ID
-      const screenshotId = `${Date.now()}`
+      const screenshotId = renderId
       this._pendingScreenshots.add(screenshotId)
       
       try {
@@ -939,12 +971,6 @@ class AchievementCheck extends plugin {
 
   // 清理资源
   _cleanupResources() {
-    // 清除定时清理任务
-    if (this._cleanupInterval) {
-      clearInterval(this._cleanupInterval)
-      logger.info('mCat-ac: 已停止定期清理临时文件任务')
-    }
-    
     if (this._pendingScreenshots && this._pendingScreenshots.size > 0) {
       logger.warn(`mCat-ac: 正在清理 ${this._pendingScreenshots.size} 个未完成的截图任务`)
       // 清空待处理任务集合
@@ -952,7 +978,8 @@ class AchievementCheck extends plugin {
       // 强制设置生成标志为false
       this._isGeneratingImages = false
     }
-    
+
+    disposeLifecycle()
     // 清理过期的临时文件
     this._cleanupTempFiles()
   }
@@ -3134,15 +3161,16 @@ class AchievementCheck extends plugin {
     // 生成HTML内容
     const html = await this.generateHtml(renderData)
     
-    // 保存HTML到临时文件
-    const htmlPath = path.join(tempDir, `${Date.now()}.html`)
+    // HTML与PNG共用同一渲染ID，确保延迟清理能找到关联文件
+    const renderId = `${Date.now()}`
+    const htmlPath = path.join(tempDir, `${renderId}.html`)
     await fs.writeFile(htmlPath, html, 'utf8')
     
     // 使用puppeteer渲染
-    const imagePath = path.join(tempDir, `${Date.now()}.png`)
+    const imagePath = path.join(tempDir, `${renderId}.png`)
     
     // 生成截图任务ID
-    const screenshotId = `${Date.now()}`
+    const screenshotId = renderId
     this._pendingScreenshots.add(screenshotId)
     
     try {
@@ -3672,10 +3700,8 @@ class AchievementCheck extends plugin {
   // 初始化配置文件监听器
   async initConfigWatchers() {
     try {
-      // 动态导入chokidar，避免在不支持的环境中出错
-      const chokidar = (await import('chokidar')).default;
       // 监听默认模板的配置文件
-      this._watchConfigFile(path.join(__dirname, 'res/wFile/def/theme-config.yaml'));
+      await this._watchConfigFile(path.join(__dirname, 'res/wFile/def/theme-config.yaml'));
       logger.info('mCat-ac: 配置文件监听器初始化完成');
     } catch (err) {
       logger.warn(`mCat-ac: 初始化配置监听器失败: ${err.message}`);
@@ -3685,11 +3711,11 @@ class AchievementCheck extends plugin {
   // 监听单个配置文件
   async _watchConfigFile(configPath) {
     try {
+      if (this.watchers.has(configPath)) return;
+
       const chokidar = (await import('chokidar')).default;
-      // 如果已经有监听器，先关闭
-      if (this.watchers.has(configPath)) {
-        this.watchers.get(configPath).close();
-      }
+      // 并发读取配置时，动态导入完成前可能已有其他实例创建监听器
+      if (this.watchers.has(configPath)) return;
       
       // 创建新的文件监听器
       const watcher = chokidar.watch(configPath, {
@@ -3705,6 +3731,10 @@ class AchievementCheck extends plugin {
       
       watcher.on('error', (error) => {
         logger.error(`mCat-ac: 监听配置文件失败: ${error.message}`);
+        if (this.watchers.get(configPath) === watcher) {
+          this.watchers.delete(configPath);
+        }
+        Promise.resolve(watcher.close()).catch(() => {});
       });
       
       this.watchers.set(configPath, watcher);
