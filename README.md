@@ -4,7 +4,7 @@
   <img src="./res/icon.png" alt="mCat-ac Logo" width="120" height="120">
   
   <div style="margin-top: 10px;">
-    <img src="https://img.shields.io/badge/版本-2.7.9-blue.svg" alt="版本">
+    <img src="https://img.shields.io/badge/版本-3.0.0-blue.svg" alt="版本">
     <img src="https://img.shields.io/badge/Node.js-v16%2B-green.svg" alt="Node.js">
     <img src="https://img.shields.io/badge/兼容-YunzaiBot-blue.svg" alt="YunzaiBot">
     <img src="https://img.shields.io/badge/许可证-MIT-yellow.svg" alt="许可证">
@@ -90,8 +90,9 @@ git clone https://gitlab.com/mcat0/mCat-ac.git ./plugins/mCat-ac/
 | **#成就帮助** | 显示详细帮助信息 | `#成就帮助` |
 | **#成就录入** | 启动成就录入向导 | `#成就录入` |
 | **#成就录入[ID/名称]** | 直接录入特定成就 | `#成就录入 123` |
-| **#成就查漏** | 生成成就查漏报告 | `#成就查漏` |
+| **#成就查漏** | 生成全部类目的完成与缺失概况表 | `#成就查漏` |
 | **#成就查漏[类目名]** | 查询指定类目的未完成成就 | `#成就查漏 天地万象` |
+| **#成就查询[ID/名称]** | 查询指定成就的信息与完成状态 | `#成就查询 动物园大亨` |
 | **#成就重置** | 清空当前用户数据 | `#成就重置` |
 | **分享椰羊网站链接** | 导入成就数据 | (私聊发送链接) |
 
@@ -152,7 +153,12 @@ sequenceDiagram
 
 ## 更新日志
 
-### v2.9.4 (最新版本)
+### v3.0.0 (最新版本)
+- ✨ 新增 `#成就查询[ID/名称]`，支持跨全部类目查询成就信息和完成状态
+- 📊 无参数 `#成就查漏` 改为全部类目的完成与缺失概况表
+- ⚡ 共享成就目录缓存，减少重复读取校对文件
+
+### v2.9.4
 - 🐛 修复#成就查漏命令注册问题，添加了对带类目名格式的命令注册
 - 🔧 确保#成就查漏 天地万象、#成就查漏+天地万象、#成就查漏天地万象等所有格式都能正确匹配和处理
 
