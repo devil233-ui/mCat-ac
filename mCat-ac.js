@@ -66,6 +66,9 @@ const lifecycleState = {
   sigintHandler: null,
   configCache: new Map(),
   watchers: new Map(),
+  achievementCatalog: null,
+  achievementCatalogTime: 0,
+  achievementCatalogPromise: null,
   pendingScreenshots: new Set(),
   isGeneratingImages: false,
   dispose: null
@@ -296,6 +299,7 @@ class AchievementCheck extends plugin {
         { reg: '^#成就录入(.+)$', fnc: 'inputByIdOrName' },
         { reg: '^#成就查漏$', fnc: 'checkAchievements' },
         { reg: '^#成就查漏(?:\\+|\\s+)?.*', fnc: 'checkAchievements' },
+        { reg: '^#成就查询(?:\\+|\\s+)?(.*)$', fnc: 'queryAchievement' },
         { reg: '^#成就重置$', fnc: 'resetAchievements' },
         { reg: '^#更新校对文件$', fnc: 'updateCheckFile' },
         { reg: '^#强制更新校对文件$', fnc: 'forceUpdateCheckFile' },
@@ -440,6 +444,7 @@ class AchievementCheck extends plugin {
           { command: '#成就录入[ID/名称]', description: '直接录入指定ID或名称的成就' },
           { command: '#成就查漏', description: '生成成就查漏报告，显示未完成的成就' },
           { command: '#成就查漏[类目名]', description: '查询指定类目的未完成成就' },
+          { command: '#成就查询[ID/名称]', description: '查询指定成就的信息与完成状态' },
           { command: '#成就重置', description: '重置当前用户的成就数据' },
           { command: '分享椰羊网站链接', description: '自动导入成就数据' }
         ],
@@ -1268,6 +1273,66 @@ class AchievementCheck extends plugin {
     }
   }
       
+  // 从椰羊/UIAF数据中提取查询页需要的进度与完成时间
+  parseAchievementRecords (data, completedIds = []) {
+    const completedSet = new Set(completedIds.map(Number))
+    const records = {}
+    const visited = new Set()
+
+    const normalizeTimestamp = item => {
+      const rawTimestamp = Number(item?.timestamp)
+      if (Number.isFinite(rawTimestamp) && rawTimestamp > 0) {
+        return Math.floor(rawTimestamp > 1e12 ? rawTimestamp / 1000 : rawTimestamp)
+      }
+
+      if (typeof item?.date === 'string' && item.date.trim()) {
+        const parsedDate = Date.parse(item.date)
+        if (Number.isFinite(parsedDate) && parsedDate > 0) return Math.floor(parsedDate / 1000)
+      }
+
+      return null
+    }
+
+    const normalizeCurrent = item => {
+      const candidates = [item?.current, item?.progress]
+      if (typeof item?.status === 'string') candidates.push(item.status)
+
+      for (const candidate of candidates) {
+        if (candidate === null || candidate === undefined || candidate === '') continue
+        const value = Number(candidate)
+        if (Number.isFinite(value)) return value
+      }
+      return null
+    }
+
+    const visit = value => {
+      if (!value || typeof value !== 'object' || visited.has(value)) return
+      visited.add(value)
+
+      if (!Array.isArray(value)) {
+        const id = Number(value.id)
+        if (Number.isInteger(id) && completedSet.has(id)) {
+          const current = normalizeCurrent(value)
+          const timestamp = normalizeTimestamp(value)
+          if (current !== null || timestamp !== null) {
+            const previous = records[id] || {}
+            records[id] = {
+              ...(previous.current !== undefined ? { current: previous.current } : {}),
+              ...(previous.timestamp !== undefined ? { timestamp: previous.timestamp } : {}),
+              ...(current !== null ? { current } : {}),
+              ...(timestamp !== null ? { timestamp } : {})
+            }
+          }
+        }
+      }
+
+      for (const nested of Array.isArray(value) ? value : Object.values(value)) visit(nested)
+    }
+
+    visit(data)
+    return records
+  }
+
   // 解析成就文件
   parseAchievementFile(data) {
     try {
@@ -1677,7 +1742,7 @@ class AchievementCheck extends plugin {
   }
   
   // 保存用户成就数据（优化版）
-  async saveUserAchievements (userId, completedIds) {
+  async saveUserAchievements (userId, completedIds, achievementRecords = {}) {
     const filePath = path.join(__dirname, `data/UserLog/${userId}.json`)
     
     // 异步创建目录（如果不存在）
@@ -1689,7 +1754,7 @@ class AchievementCheck extends plugin {
     }
     
     // 读取已有数据或创建新数据 - 使用try-catch优化错误处理
-    let userData = { completedIds: [], timestamp: Date.now() }
+    let userData = { completedIds: [], achievementRecords: {}, timestamp: Date.now() }
     let existingCompletedIds = []
     
     try {
@@ -1716,7 +1781,27 @@ class AchievementCheck extends plugin {
       // 文件不存在或其他错误，使用默认数据
     }
     
-    // 性能优化：仅当有新ID时才更新
+    const existingRecords = userData.achievementRecords && typeof userData.achievementRecords === 'object'
+      ? userData.achievementRecords
+      : {}
+    const mergedRecords = { ...existingRecords }
+    let recordsChanged = false
+
+    for (const [id, record] of Object.entries(achievementRecords || {})) {
+      if (!record || typeof record !== 'object') continue
+      const normalizedRecord = {
+        ...(existingRecords[id] && typeof existingRecords[id] === 'object' ? existingRecords[id] : {}),
+        ...(Number.isFinite(Number(record.current)) ? { current: Number(record.current) } : {}),
+        ...(Number.isFinite(Number(record.timestamp)) && Number(record.timestamp) > 0
+          ? { timestamp: Math.floor(Number(record.timestamp)) }
+          : {})
+      }
+      if (Object.keys(normalizedRecord).length === 0) continue
+      if (JSON.stringify(existingRecords[id] || {}) !== JSON.stringify(normalizedRecord)) recordsChanged = true
+      mergedRecords[id] = normalizedRecord
+    }
+
+    // 性能优化：仅当有新ID或新的椰羊统计数据时才更新
     if (completedIds.length > 0) {
       // 使用Set进行高效去重
       const currentSet = new Set(existingCompletedIds)
@@ -1731,10 +1816,11 @@ class AchievementCheck extends plugin {
         logger.info(`[mCat-ac] 自动添加成就ID ${targetAchievementId} 到用户${userId}的成就数据中`);
       }
       
-      if (addedCount > 0 || addedTargetId) {
+      if (addedCount > 0 || addedTargetId || recordsChanged) {
         // 合并并去重
         const uniqueIds = [...new Set([...Array.from(currentSet), ...completedIds])]
         userData.completedIds = uniqueIds
+        userData.achievementRecords = mergedRecords
         userData.timestamp = Date.now()
         userData.lastUpdate = new Date().toISOString()
         
@@ -1895,10 +1981,11 @@ class AchievementCheck extends plugin {
           
           // 解析成就数据
           const achievements = this.parseAchievementFile(data)
+          const achievementRecords = this.parseAchievementRecords(data, achievements)
           
           if (achievements.length > 0) {
             // 保存用户成就
-            await this.saveUserAchievements(userId, achievements)
+            await this.saveUserAchievements(userId, achievements, achievementRecords)
             delete userInputStatus[userId]
             await e.reply(`成功导入 ${achievements.length} 个成就！`)  
           } else {
@@ -1970,10 +2057,11 @@ class AchievementCheck extends plugin {
       
       // 解析成就数据
       const achievements = this.parseAchievementFile(data.value)
+      const achievementRecords = this.parseAchievementRecords(data.value, achievements)
       
       if (achievements.length > 0) {
         // 保存用户成就
-        await this.saveUserAchievements(userId, achievements)
+        await this.saveUserAchievements(userId, achievements, achievementRecords)
         
         // 清理状态
         if (userInputStatus[userId]) {
@@ -2009,6 +2097,76 @@ class AchievementCheck extends plugin {
     }
   }
   
+  invalidateAchievementCatalog () {
+    lifecycleState.achievementCatalog = null
+    lifecycleState.achievementCatalogTime = 0
+    lifecycleState.achievementCatalogPromise = null
+    this.cachedAchievements = null
+    this.achievementCacheTime = 0
+  }
+
+  // 加载全部类目的成就数据，并在所有消息实例间共享缓存
+  async loadAchievementCatalog (force = false) {
+    const CACHE_TTL = 60 * 60 * 1000
+
+    if (force) this.invalidateAchievementCatalog()
+
+    if (
+      lifecycleState.achievementCatalog &&
+      Date.now() - lifecycleState.achievementCatalogTime < CACHE_TTL
+    ) {
+      this.cachedAchievements = lifecycleState.achievementCatalog
+      this.achievementCacheTime = lifecycleState.achievementCatalogTime
+      return lifecycleState.achievementCatalog
+    }
+
+    if (!lifecycleState.achievementCatalogPromise) {
+      lifecycleState.achievementCatalogPromise = (async () => {
+        const catalogPath = path.join(__dirname, 'data/mCatAc/mCatAc.json')
+        const catalogData = JSON.parse(await fs.readFile(catalogPath, 'utf8'))
+        const categories = Array.isArray(catalogData?.categories) ? catalogData.categories : []
+        const allAchievements = []
+
+        for (const category of categories) {
+          const fileName = path.basename(category.fileName || '')
+          if (!fileName || fileName !== category.fileName) {
+            logger.warn(`mCat-ac: 跳过无效成就文件名: ${category.fileName || '空'}`)
+            continue
+          }
+
+          try {
+            const filePath = path.join(__dirname, 'data/mCatAc/File', fileName)
+            const achievementData = JSON.parse(await fs.readFile(filePath, 'utf8'))
+            if (!Array.isArray(achievementData?.achievements)) continue
+
+            const categoryName = achievementData.name || category.name || '未分类'
+            allAchievements.push(...achievementData.achievements.map(achievement => ({
+              ...achievement,
+              categoryName,
+              fileName
+            })))
+          } catch (error) {
+            logger.warn(`${COLORS.YELLOW}读取成就文件 ${fileName} 失败: ${error.message}${COLORS.RESET}`)
+          }
+        }
+
+        const catalog = { ...catalogData, categories, achievements: allAchievements }
+        lifecycleState.achievementCatalog = catalog
+        lifecycleState.achievementCatalogTime = Date.now()
+        return catalog
+      })()
+    }
+
+    try {
+      const catalog = await lifecycleState.achievementCatalogPromise
+      this.cachedAchievements = catalog
+      this.achievementCacheTime = lifecycleState.achievementCatalogTime
+      return catalog
+    } finally {
+      lifecycleState.achievementCatalogPromise = null
+    }
+  }
+
   // 成就比对（优化版）
   async compareAchievements (e, userId, progressInfo = [], targetCategory = null) {
     try {
@@ -2022,60 +2180,7 @@ class AchievementCheck extends plugin {
       const completedIds = await this.getUserAchievements(userId)
       const userData = { completedIds } // 包装成标准格式
       
-      // 读取总成就数据 - 使用缓存机制
-      const acFilePath = path.join(__dirname, 'data/mCatAc/mCatAc.json')
-      
-      // 初始化缓存属性
-      if (typeof this.cachedAchievements === 'undefined') {
-        this.cachedAchievements = null
-      }
-      if (typeof this.achievementCacheTime === 'undefined') {
-        this.achievementCacheTime = 0
-      }
-      
-      // 检查是否有缓存的成就数据
-      if (!this.cachedAchievements || (Date.now() - this.achievementCacheTime > 3600000)) {
-        // 缓存过期或不存在，重新读取
-        const acDataStr = await fs.readFile(acFilePath, 'utf8')
-        const catalogData = JSON.parse(acDataStr)
-        
-        // 初始化成就数组
-        const allAchievements = []
-        
-        // 读取所有成就文件内容
-        if (catalogData?.categories && Array.isArray(catalogData.categories)) {
-          for (const category of catalogData.categories) {
-            const filePath = path.join(__dirname, 'data/mCatAc/File', category.fileName)
-            try {
-              await fs.access(filePath)
-              const fileContent = await fs.readFile(filePath, 'utf8')
-              const achievementData = JSON.parse(fileContent)
-              
-              // 将该分类下的所有成就添加到总数组中，并添加分类信息
-              if (achievementData?.achievements && Array.isArray(achievementData.achievements)) {
-                const categoryAchievements = achievementData.achievements.map(ac => ({
-                  ...ac,
-                  categoryName: achievementData.name || category.name || '未分类',
-                  fileName: category.fileName
-                }))
-                allAchievements.push(...categoryAchievements)
-              }
-            } catch (err) {
-              // 保留文件读取失败的警告日志
-              logger.warn(`${COLORS.YELLOW}读取成就文件 ${category.fileName} 失败: ${err.message}${COLORS.RESET}`)
-            }
-          }
-        }
-        
-        // 创建完整的成就数据对象
-        this.cachedAchievements = {
-          ...catalogData,
-          achievements: allAchievements
-        }
-        this.achievementCacheTime = Date.now()
-      }
-      
-      const acData = this.cachedAchievements
+      const acData = await this.loadAchievementCatalog()
       
       // 计算已完成和未完成的成就
       const completedSet = new Set(userData.completedIds)
@@ -2096,9 +2201,23 @@ class AchievementCheck extends plugin {
         return
       }
       
-      // 处理类目筛选
-      const categoryFileNameMap = {
-        '天地万象': 'wonders_of_the_world.json'
+      const normalizedTarget = targetCategory?.trim()
+      const matchingCategories = new Set()
+
+      if (normalizedTarget) {
+        const lowerTarget = normalizedTarget.toLowerCase()
+        for (const ac of achievements) {
+          const categoryName = ac.categoryName || '未分类'
+          const fileName = ac.fileName?.replace(/\.json$/i, '').toLowerCase() || ''
+          if (categoryName.includes(normalizedTarget) || fileName.includes(lowerTarget)) {
+            matchingCategories.add(categoryName)
+          }
+        }
+
+        if (matchingCategories.size === 0) {
+          await e.reply(`未找到成就类目“${normalizedTarget}”，请使用完整或部分中文类目名重试`)
+          return
+        }
       }
       
       for (const ac of achievements) {
@@ -2107,18 +2226,7 @@ class AchievementCheck extends plugin {
           continue
         }
         
-        // 如果指定了目标类目，则只处理该类目的成就
-        if (targetCategory) {
-          const targetFileName = categoryFileNameMap[targetCategory] || targetCategory
-          // 修复逻辑错误：只有当成就既不匹配分类名称也不匹配文件名时才跳过
-          const isCategoryMatch = ac.categoryName === targetCategory
-          const isFileNameMatch = ac.fileName && ac.fileName.includes(targetFileName)
-          
-          // 如果都不匹配，则跳过
-          if (!isCategoryMatch && !isFileNameMatch) {
-            continue
-          }
-        }
+        if (normalizedTarget && !matchingCategories.has(ac.categoryName || '未分类')) continue
         
         if (!completedSet.has(ac.id)) {
           incompleteAchievements.push(ac)
@@ -2127,7 +2235,11 @@ class AchievementCheck extends plugin {
       }
       
       // 进度反馈
-      const completedCount = userData.completedIds ? userData.completedIds.length : 0;
+      const scopedAchievements = achievements.filter(ac => (
+        ac.id !== EXCLUDED_ACHIEVEMENT_ID &&
+        (!normalizedTarget || matchingCategories.has(ac.categoryName || '未分类'))
+      ))
+      const completedCount = scopedAchievements.filter(ac => completedSet.has(ac.id)).length
       const compareResult = `比对完成，耗时: ${Math.round((Date.now() - compareStartTime) / 1000)}秒\n已完成成就: ${completedCount}\n未完成成就: ${incompleteAchievements.length}\n可获取奖励: ${totalReward}原石`;
       
       // 保留成就比对结果的关键日志
@@ -2139,32 +2251,48 @@ class AchievementCheck extends plugin {
       // 清空进度信息，不需要发送进度
       progressInfo.length = 0;
       
-      // 排序：优先显示"天地万象"类目的成就
-      const sortedAchievements = [...incompleteAchievements].sort((a, b) => {
-        const categoryA = a.categoryName || '未分类'
-        const categoryB = b.categoryName || '未分类'
-        
-        // 天地万象优先
-        if (categoryA === '天地万象' && categoryB !== '天地万象') return -1
-        if (categoryA !== '天地万象' && categoryB === '天地万象') return 1
-        
-        // 其他情况按原顺序
-        return 0
-      })
-      
-      // 优化：只显示少量未完成成就的预览，避免生成过多图片
-      // 限制返回的未完成成就数量，默认显示前50个
-      const displayIncompleteAchievements = sortedAchievements.slice(0, 50);
-      
-      await this.generateResultImages(e, {
-        completedCount: completedCount,
-        incompleteCount: incompleteAchievements.length,
-        incompleteAchievements: displayIncompleteAchievements,
-        totalReward: totalReward,
-        // 添加完整数量信息，方便用户了解
-        actualIncompleteCount: incompleteAchievements.length,
-        displayLimit: 50
-      })
+      if (normalizedTarget) {
+        const displayLimit = 50
+        const displayIncompleteAchievements = incompleteAchievements
+          .map(ac => ({ ...ac, category: ac.categoryName || '未分类' }))
+          .slice(0, displayLimit)
+
+        await this.generateResultImages(e, {
+          pageTitle: `成就查漏：${[...matchingCategories].join('、')}`,
+          completedCount,
+          incompleteCount: incompleteAchievements.length,
+          incompleteAchievements: displayIncompleteAchievements,
+          totalReward,
+          actualIncompleteCount: incompleteAchievements.length,
+          displayLimit
+        })
+      } else {
+        const overviewMap = new Map()
+        for (const ac of scopedAchievements) {
+          const category = ac.categoryName || '未分类'
+          if (!overviewMap.has(category)) {
+            overviewMap.set(category, { category, completedCount: 0, incompleteCount: 0, reward: 0 })
+          }
+          const overview = overviewMap.get(category)
+          if (completedSet.has(ac.id)) {
+            overview.completedCount++
+          } else {
+            overview.incompleteCount++
+            overview.reward += ac.reward || 0
+          }
+        }
+
+        await this.generateResultImages(e, {
+          pageTitle: '全类目成就概况',
+          completedCount,
+          incompleteCount: incompleteAchievements.length,
+          incompleteAchievements: [],
+          categoryOverview: [...overviewMap.values()],
+          totalReward,
+          actualIncompleteCount: incompleteAchievements.length,
+          displayLimit: overviewMap.size
+        })
+      }
     } catch (err) {
       // 保留错误日志
       logger.error(`成就比对时出错: ${err.message}`)
@@ -2195,6 +2323,140 @@ class AchievementCheck extends plugin {
     }
   }
   
+  async getUserAchievementRecords (userId) {
+    try {
+      const userFilePath = path.join(__dirname, 'data/UserLog', `${userId}.json`)
+      const userData = JSON.parse(await fs.readFile(userFilePath, 'utf8'))
+      return userData?.achievementRecords && typeof userData.achievementRecords === 'object'
+        ? userData.achievementRecords
+        : {}
+    } catch (error) {
+      if (error.code !== 'ENOENT') logger.warn(`读取用户成就统计失败: ${error.message}`)
+      return {}
+    }
+  }
+
+  getAchievementProgressTarget (achievement) {
+    const explicitTotal = Number(achievement?.total)
+    if (Number.isFinite(explicitTotal) && explicitTotal > 0) return explicitTotal
+
+    const numbers = String(achievement?.desc || '').match(/\d+(?:\.\d+)?/g)
+    if (!numbers?.length) return null
+    const inferredTotal = Number(numbers[numbers.length - 1])
+    return Number.isFinite(inferredTotal) && inferredTotal > 0 ? inferredTotal : null
+  }
+
+  formatAchievementTimestamp (timestamp) {
+    const seconds = Number(timestamp)
+    if (!Number.isFinite(seconds) || seconds <= 0) return null
+
+    const parts = new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23'
+    }).formatToParts(new Date(seconds * 1000))
+    const value = type => parts.find(part => part.type === type)?.value || ''
+    return `${value('year')}/${value('month')}/${value('day')} ${value('hour')}:${value('minute')}:${value('second')}`
+  }
+
+  // 查询指定成就的信息与当前用户完成状态
+  async queryAchievement (e) {
+    const message = e.message?.[0]?.text || e.raw_message || e.msg || ''
+    const keyword = message.replace(/^#成就查询(?:\+|\s+)?/, '').trim()
+
+    if (!keyword) {
+      await e.reply('请输入成就ID或名称，例如：#成就查询 80127 或 #成就查询 动物园大亨')
+      return true
+    }
+
+    const userId = e.user_id
+    try {
+      await fs.access(path.join(__dirname, `data/UserLog/${userId}.json`))
+    } catch {
+      await e.reply('未发现已录入成就，请先进行#成就录入')
+      return true
+    }
+
+    try {
+      const catalog = await this.loadAchievementCatalog()
+      const achievements = catalog?.achievements || []
+      let foundAchievements = []
+
+      if (/^\d+$/.test(keyword)) {
+        const targetId = Number(keyword)
+        foundAchievements = achievements.filter(ac => ac.id === targetId)
+      } else {
+        const exactMatches = achievements.filter(ac => ac.name === keyword)
+        foundAchievements = exactMatches.length > 0
+          ? exactMatches
+          : achievements.filter(ac => ac.name?.includes(keyword))
+      }
+
+      if (foundAchievements.length === 0) {
+        await e.reply(`未找到与“${keyword}”匹配的成就`)
+        return true
+      }
+
+      const actualItemCount = foundAchievements.length
+      const displayLimit = 50
+      if (actualItemCount > displayLimit) {
+        await e.reply(`找到${actualItemCount}个结果，仅展示前${displayLimit}个；请使用更精确的名称缩小范围`)
+      }
+
+      const completedSet = new Set(await this.getUserAchievements(userId))
+      const achievementRecords = await this.getUserAchievementRecords(userId)
+      let completedCount = 0
+      let incompleteCount = 0
+      let totalReward = 0
+      const matchedAchievements = foundAchievements.map(ac => {
+        const completed = completedSet.has(ac.id)
+        if (completed) {
+          completedCount++
+        } else {
+          incompleteCount++
+          totalReward += ac.reward || 0
+        }
+
+        const record = achievementRecords[ac.id] || achievementRecords[String(ac.id)]
+        const progressCurrent = Number(record?.current)
+        const progressTotal = this.getAchievementProgressTarget(ac)
+
+        return {
+          ...ac,
+          category: ac.categoryName || '未分类',
+          name: `${completed ? '✅[已完成]' : '❌[未完成]'} ${ac.name}`,
+          completed,
+          cocogoatProgress: completed && Number.isFinite(progressCurrent) && (progressCurrent !== 0 || progressTotal !== null)
+            ? `${progressCurrent}${progressTotal !== null ? ` / ${progressTotal}` : ''}`
+            : null,
+          cocogoatCompletedAt: completed ? this.formatAchievementTimestamp(record?.timestamp) : null
+        }
+      })
+      const displayAchievements = matchedAchievements.slice(0, displayLimit)
+
+      await this.generateResultImages(e, {
+        pageTitle: `成就查询：${keyword}`,
+        resultMode: 'query',
+        completedCount,
+        incompleteCount,
+        incompleteAchievements: displayAchievements,
+        totalReward,
+        actualItemCount,
+        displayLimit
+      })
+      return true
+    } catch (error) {
+      logger.error(`查询成就时出错: ${error.message}`)
+      await e.reply('查询成就时出错，请更新校对文件后重试')
+      return true
+    }
+  }
+
   // 查询成就查漏
   async checkAchievements (e) {
     const userId = e.user_id
@@ -2709,6 +2971,7 @@ class AchievementCheck extends plugin {
 
     // 写入目录文件
     await fs.writeFile(catalogPath, JSON.stringify(catalog, null, 2));
+    this.invalidateAchievementCatalog();
     logger.info('更新了mCatAc.json目录文件');
   }
   
@@ -2726,86 +2989,13 @@ class AchievementCheck extends plugin {
   
   // 通过ID查找成就
   async findAchievementById (id) {
-    // 如果缓存已初始化，先从缓存中查找
-    if (this.cachedAchievements && this.cachedAchievements.achievements) {
-      const achievement = this.cachedAchievements.achievements.find(ac => ac.id === id)
-      if (achievement) {
-        return achievement
-      }
-    }
-    
-    // 如果缓存未初始化或缓存中找不到，尝试初始化完整缓存（从所有文件加载成就）
     try {
-      // 初始化缓存属性
-      if (typeof this.cachedAchievements === 'undefined') {
-        this.cachedAchievements = null
-      }
-      if (typeof this.achievementCacheTime === 'undefined') {
-        this.achievementCacheTime = 0
-      }
-      
-      // 读取主成就文件获取分类信息
-      const acFilePath = path.join(__dirname, 'data/mCatAc/mCatAc.json')
-      const acDataStr = await fs.readFile(acFilePath, 'utf8')
-      const catalogData = JSON.parse(acDataStr)
-      
-      // 初始化成就数组
-      const allAchievements = []
-      
-      // 读取所有成就文件内容
-      if (catalogData?.categories && Array.isArray(catalogData.categories)) {
-        for (const category of catalogData.categories) {
-          const filePath = path.join(__dirname, 'data/mCatAc/File', category.fileName)
-          try {
-            await fs.access(filePath)
-            const fileContent = await fs.readFile(filePath, 'utf8')
-            const achievementData = JSON.parse(fileContent)
-            
-            // 将该分类下的所有成就添加到总数组中
-            if (achievementData?.achievements && Array.isArray(achievementData.achievements)) {
-              allAchievements.push(...achievementData.achievements)
-              
-              // 在添加的同时检查是否有匹配的ID
-              for (const ac of achievementData.achievements) {
-                if (ac.id === id) {
-                  // 先创建完整的缓存对象
-                  this.cachedAchievements = {
-                    ...catalogData,
-                    achievements: allAchievements
-                  }
-                  this.achievementCacheTime = Date.now()
-                  
-                  // 找到匹配的成就，立即返回
-                  return ac
-                }
-              }
-            }
-          } catch (err) {
-            logger.warn(`读取成就文件 ${category.fileName} 失败: ${err.message}`)
-          }
-        }
-      }
-      
-      // 创建完整的成就数据对象
-      this.cachedAchievements = {
-        ...catalogData,
-        achievements: allAchievements
-      }
-      this.achievementCacheTime = Date.now()
-      
-      // 再次尝试从完整缓存中查找
-      if (Array.isArray(allAchievements)) {
-        for (const ac of allAchievements) {
-          if (ac.id === id) {
-            return ac
-          }
-        }
-      }
+      const catalog = await this.loadAchievementCatalog()
+      return catalog.achievements.find(ac => ac.id === Number(id)) || null
     } catch (err) {
       logger.error(`读取成就数据失败: ${err.message}`)
+      return null
     }
-    
-    return null
   }
   
   // 获取用户已完成的成就
@@ -2894,34 +3084,15 @@ class AchievementCheck extends plugin {
   
   // 查找同名的所有成就
   async findAllAchievementsByName (name) {
-    const results = []
-    
-    if (this.cachedAchievements && this.cachedAchievements.achievements) {
-      for (const ac of this.cachedAchievements.achievements) {
-        if (ac.name && (ac.name.includes(name) || name.includes(ac.name))) {
-          results.push(ac)
-        }
-      }
-    } else {
-      // 如果缓存未初始化，读取文件
-      const acFilePath = path.join(__dirname, 'data/mCatAc/mCatAc.json') // 统一使用data/mCatAc路径
-      try {
-        const acDataStr = await fs.readFile(acFilePath, 'utf8')
-        const acData = JSON.parse(acDataStr)
-        
-        if (acData?.achievements && Array.isArray(acData.achievements)) {
-          for (const ac of acData.achievements) {
-            if (ac.name && (ac.name.includes(name) || name.includes(ac.name))) {
-              results.push(ac)
-            }
-          }
-        }
-      } catch (err) {
-        logger.error(`读取成就数据失败: ${err.message}`)
-      }
+    try {
+      const catalog = await this.loadAchievementCatalog()
+      return catalog.achievements.filter(ac => (
+        ac.name && (ac.name.includes(name) || name.includes(ac.name))
+      ))
+    } catch (err) {
+      logger.error(`读取成就数据失败: ${err.message}`)
+      return []
     }
-    
-    return results
   }
   
   // 根据名称和阶段查找成就
@@ -3033,8 +3204,9 @@ class AchievementCheck extends plugin {
     this._isGeneratingImages = true
     
     try {
+      const isCategoryOverview = Array.isArray(result?.categoryOverview)
       // 检查是否有未完成的成就
-      if (!result.incompleteAchievements || result.incompleteAchievements.length === 0) {
+      if (!isCategoryOverview && (!result.incompleteAchievements || result.incompleteAchievements.length === 0)) {
         await e.reply(`🎉 恭喜你！所有成就都已完成！\n已完成成就: ${result.completedCount}\n可获取奖励: ${result.totalReward}原石`)
         return
       }
@@ -3045,7 +3217,8 @@ class AchievementCheck extends plugin {
       }
       
       // 获取实际的未完成成就总数和显示限制
-      const actualIncompleteCount = result.actualIncompleteCount || result.incompleteCount
+      const actualIncompleteCount = result.actualIncompleteCount ?? result.incompleteCount
+      const actualItemCount = result.actualItemCount ?? actualIncompleteCount
       const displayLimit = result.displayLimit || 20
       const displayCount = result.incompleteAchievements.length
       
@@ -3071,15 +3244,20 @@ class AchievementCheck extends plugin {
       const incompleteAchievements = Array.isArray(result.incompleteAchievements) ? result.incompleteAchievements : []
       
       // 计算未完成成就的总原石奖励
-      const totalRewards = incompleteAchievements.reduce((sum, achievement) => {
+      const displayedRewards = incompleteAchievements.reduce((sum, achievement) => {
         return sum + (achievement.reward || 0)
       }, 0)
+      const totalRewards = result.totalReward ?? displayedRewards
       
       // 记录正确的日志信息，包括实际数量和显示限制
       logger.info(`mCat-ac: 开始生成分页数据，实际未完成数: ${actualIncompleteCount}，显示: ${displayCount}，每页${pageSize}个，总奖励: ${totalRewards}原石`)
       
-      for (let i = 0; i < incompleteAchievements.length; i += pageSize) {
-        pages.push(incompleteAchievements.slice(i, i + pageSize))
+      if (isCategoryOverview) {
+        pages.push([])
+      } else {
+        for (let i = 0; i < incompleteAchievements.length; i += pageSize) {
+          pages.push(incompleteAchievements.slice(i, i + pageSize))
+        }
       }
       
       // 为每页生成图片
@@ -3091,12 +3269,13 @@ class AchievementCheck extends plugin {
             currentPage: i + 1,
             totalPages: pages.length,
             achievements: pages[i], // 确保只传递当前页的未完成成就
+            categoryOverview: isCategoryOverview ? result.categoryOverview : undefined,
             isIncompleteList: true, // 添加标志确认这是未完成成就列表
             actualIncompleteCount: actualIncompleteCount, // 传递真实的未完成数量
             displayLimit: displayLimit, // 传递显示限制
             uid: uid, // 传递UID信息
             completedCount: result.completedCount || 0, // 已完成成就数量
-            incompleteCount: actualIncompleteCount || 0, // 未完成成就数量
+            incompleteCount: result.incompleteCount ?? actualIncompleteCount ?? 0, // 未完成成就数量
             totalRewards: totalRewards // 可获得的总原石数量
           }
           
@@ -3110,8 +3289,8 @@ class AchievementCheck extends plugin {
       }
       
       // 如果有实际未完成成就但只显示了一部分，提示用户
-      if (displayCount < actualIncompleteCount) {
-        await e.reply(`📋 检测到 ${actualIncompleteCount} 个未完成成就，这里只显示前 ${displayLimit} 个最优先的。`)
+      if (!isCategoryOverview && displayCount < actualItemCount) {
+        await e.reply(`📋 共有${actualItemCount}条结果，这里只显示前${displayLimit}条。`)
       }
       
       // 发送图片（使用卡片消息）
@@ -3181,7 +3360,10 @@ class AchievementCheck extends plugin {
       // 完全自适应高度设置，移除固定最大高度限制
       // 根据成就数量和内容动态计算所需高度
       const achievementCount = data.achievements?.length || 0
-      const viewportHeight = 300 + achievementCount * 200 // 增加每个成就项的估算高度为200px，确保足够空间
+      const overviewCount = data.categoryOverview?.length || 0
+      const viewportHeight = overviewCount > 0
+        ? 420 + overviewCount * 58
+        : 300 + achievementCount * 200 // 增加每个成就项的估算高度为200px，确保足够空间
       
       // 检查是否为API背景图片（网络图片）
       const isApiBackground = backgroundUrl && (backgroundUrl.startsWith('http://') || backgroundUrl.startsWith('https://'))

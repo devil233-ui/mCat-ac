@@ -375,6 +375,48 @@ const generateCSS = (config, data) => {
         padding: 0 30px 30px 30px; /* 将底部内边距从20px改为30px，与左右间距一致 */
         align-items: center;
       }
+
+      .overview-table-wrapper {
+        width: 100%;
+        background: rgba(0, 0, 0, 0.45);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        border-radius: 24px;
+        padding: 18px 22px;
+      }
+
+      .overview-table {
+        width: 100%;
+        border-collapse: collapse;
+        color: #FFF2E0;
+        font-size: 17px;
+      }
+
+      .overview-table th,
+      .overview-table td {
+        padding: 10px 12px;
+        border-bottom: 1px solid rgba(255, 214, 158, 0.2);
+        text-align: center;
+      }
+
+      .overview-table th {
+        color: #FFD69E;
+        font-size: 19px;
+      }
+
+      .overview-table th:first-child,
+      .overview-table td:first-child {
+        text-align: left;
+      }
+
+      .overview-table tbody tr:last-child td {
+        border-bottom: none;
+      }
+
+      .overview-command {
+        color: #D3F4FF;
+        font-size: 14px;
+      }
       
       /* 成就项样式 - 严格按照规范要求的尺寸和样式 */
       .achievement-item {
@@ -389,6 +431,33 @@ const generateCSS = (config, data) => {
         align-items: center;
         margin: 0 auto;
         border: 1px solid transparent; /* 预留边框空间 */
+        position: relative;
+      }
+
+      .achievement-cocogoat-stats {
+        display: contents;
+      }
+
+      .achievement-cocogoat-progress,
+      .achievement-cocogoat-time {
+        color: #69B9FF;
+        font-family: Consolas, Monaco, monospace;
+        font-size: 13px;
+        line-height: 1.35;
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      .achievement-cocogoat-progress {
+        grid-column: 2;
+        grid-row: 2;
+        align-self: center;
+      }
+
+      .achievement-cocogoat-time {
+        grid-column: 2;
+        grid-row: 3;
+        align-self: start;
       }
       
       /* 成就主体内容布局 */
@@ -402,24 +471,33 @@ const generateCSS = (config, data) => {
       
       /* 成就内容整体 */
       .achievement-content {
-        display: flex;
-        flex-direction: column;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) max-content;
+        grid-template-rows: auto auto auto;
+        column-gap: 8px;
+        row-gap: 2px;
         flex: 1;
+        min-width: 0;
         align-items: flex-start;
       }
       
       /* 成就名称和ID */
       .achievement-name-id {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex: 1;
-        margin-bottom: 3px;
+        display: contents;
+      }
+
+      .achievement-id-column {
+        display: contents;
       }
       
       .achievement-id {
+        grid-column: 2;
+        grid-row: 1;
+        align-self: center;
+        justify-self: end;
         font-size: ${fontSize.content}px; /* 规范要求：成就id 14px */
         color: #FFD69E; /* 规范要求：成就id #FFD69E */
+        white-space: nowrap;
       }
       
       /* 成就奖励 */
@@ -444,12 +522,18 @@ const generateCSS = (config, data) => {
       
       /* 成就名称和描述 */
       .achievement-name {
+        grid-column: 1;
+        grid-row: 1;
+        min-width: 0;
         font-size: ${fontSize.subtitle}px; /* 使用配置中的副标题大小 */
         color: #FFD69E; /* 规范要求：成就名字 #FFD69E */
         font-weight: bold;
       }
       
       .achievement-desc {
+        grid-column: 1;
+        grid-row: 2 / span 2;
+        min-width: 0;
         font-size: ${fontSize.content}px; /* 使用配置中的内容大小 */
         color: #FFD69E; /* 规范要求：成就描述 #FFD69E */
         line-height: 1.3;
@@ -569,9 +653,18 @@ const renderHtml = async (data) => {
     // 准备成就分类数据
     const categories = {};
     const achievements = Array.isArray(data?.achievements) ? data.achievements : [];
+    const categoryOverview = Array.isArray(data?.categoryOverview) ? data.categoryOverview : [];
     
-    // 首先尝试加载成就系列文件进行精确分类
-    try {
+    const hasExplicitCategories = achievements.every(ac => ac?.category || ac?.categoryName);
+    if (categoryOverview.length > 0 || hasExplicitCategories) {
+      achievements.forEach(ac => {
+        const categoryName = ac?.category || ac?.categoryName || '未分类';
+        if (!categories[categoryName]) categories[categoryName] = [];
+        categories[categoryName].push(ac);
+      });
+    } else {
+      try {
+        // 仅兼容没有携带类目信息的旧调用方
       // 创建成就ID到分类名称的完整映射
       const achievementIdToCategory = {};
       
@@ -705,12 +798,12 @@ const renderHtml = async (data) => {
       
       // 对成就进行分类
       achievements.forEach(ac => {
-        let categoryName = '未分类';
+        let categoryName = ac?.category || ac?.categoryName || '未分类';
         
         // 优先使用精确ID映射
-        if (ac?.id && achievementIdToCategory[ac.id]) {
+        if (categoryName === '未分类' && ac?.id && achievementIdToCategory[ac.id]) {
           categoryName = achievementIdToCategory[ac.id];
-        } else if (ac?.id) {
+        } else if (categoryName === '未分类' && ac?.id) {
           const id = Number(ac.id);
           if (!isNaN(id)) {
             // 使用ID范围进行备用分类
@@ -727,16 +820,17 @@ const renderHtml = async (data) => {
         }
         categories[categoryName].push(ac);
       });
-    } catch (error) {
-      console.error('加载成就分类数据失败:', error);
-      // 回退到简单的分类方式
-      achievements.forEach(ac => {
-        const categoryName = '未分类';
-        if (!categories[categoryName]) {
-          categories[categoryName] = [];
-        }
-        categories[categoryName].push(ac);
-      });
+      } catch (error) {
+        console.error('加载成就分类数据失败:', error);
+        // 回退到简单的分类方式
+        achievements.forEach(ac => {
+          const categoryName = '未分类';
+          if (!categories[categoryName]) {
+            categories[categoryName] = [];
+          }
+          categories[categoryName].push(ac);
+        });
+      }
     }
     
     // 生成HTML
@@ -746,7 +840,7 @@ const renderHtml = async (data) => {
       <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>${config?.page?.title || '成就查漏结果'}</title>
+        <title>${data?.pageTitle || config?.page?.title || '成就查漏结果'}</title>
         <style>
           ${css}
         </style>
@@ -754,7 +848,7 @@ const renderHtml = async (data) => {
       <body>
         <div class="container">
           <div class="header">
-            <h1>${config?.header?.title || '成就查漏结果'}</h1>
+            <h1>${data?.pageTitle || config?.header?.title || '成就查漏结果'}</h1>
             <div class="uid-info">uid: ${data?.uid || '未知UID'}</div>
             <div class="overall-stats">
               <span>已完成:${data?.completedCount || 0}</span>
@@ -765,26 +859,64 @@ const renderHtml = async (data) => {
           </div>
           
           <div class="achievement-categories">
-            ${Object.entries(categories).map(([category, items]) => {
+            ${categoryOverview.length > 0 ? `
+              <div class="overview-table-wrapper">
+                <table class="overview-table">
+                  <thead>
+                    <tr>
+                      <th>成就类目</th>
+                      <th>已完成</th>
+                      <th>未完成</th>
+                      <th>可获原石</th>
+                      <th>详情指令</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${categoryOverview.map(item => `
+                      <tr>
+                        <td>${item.category}</td>
+                        <td>${item.completedCount}</td>
+                        <td>${item.incompleteCount}</td>
+                        <td>${item.reward}</td>
+                        <td class="overview-command">#成就查漏 ${item.category}</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              </div>
+            ` : Object.entries(categories).map(([category, items]) => {
               try {
-                const rewardTotal = items.reduce((sum, ac) => sum + (Number(ac?.reward) || 0), 0);
+                const rewardTotal = items.reduce((sum, ac) => {
+                  if (data?.resultMode === 'query' && ac?.completed) return sum;
+                  return sum + (Number(ac?.reward) || 0);
+                }, 0);
                   return `
                     <div class="achievement-category">
                       <div class="category-header">
                         <h2 class="category-title">${category}</h2>
                         <div class="category-stats">
-                          <span class="incomplete-count">还有${items.length}个成就未完成</span>
+                          <span class="incomplete-count">${data?.resultMode === 'query' ? `共${items.length}个查询结果` : `还有${items.length}个成就未完成`}</span>
                           <span class="category-reward">可获得原石:${rewardTotal}</span>
                         </div>
                       </div>
                       <div class="category-achievements">
                         ${items.map(ac => `
-                          <div class="achievement-item">
+                          <div class="achievement-item${ac?.cocogoatProgress || ac?.cocogoatCompletedAt ? ' has-cocogoat-stats' : ''}">
                               <div class="achievement-main">
                                 <div class="achievement-content">
                                   <div class="achievement-name-id">
                                     <span class="achievement-name">${ac?.name || '未知成就'}</span>
-                                    ${config?.achievement?.showId !== false ? `<span class="achievement-id">id:${ac?.id || '-'}</span>` : ''}
+                                    ${config?.achievement?.showId !== false ? `
+                                      <div class="achievement-id-column">
+                                        <span class="achievement-id">id:${ac?.id || '-'}</span>
+                                        ${ac?.cocogoatProgress || ac?.cocogoatCompletedAt ? `
+                                          <div class="achievement-cocogoat-stats">
+                                            ${ac?.cocogoatProgress ? `<div class="achievement-cocogoat-progress">${ac.cocogoatProgress}</div>` : ''}
+                                            ${ac?.cocogoatCompletedAt ? `<div class="achievement-cocogoat-time">${ac.cocogoatCompletedAt}</div>` : ''}
+                                          </div>
+                                        ` : ''}
+                                      </div>
+                                    ` : ''}
                                   </div>
                                   ${config?.achievement?.showDesc !== false ? `<div class="achievement-desc">${ac?.desc || ''}</div>` : ''}
                                 </div>
